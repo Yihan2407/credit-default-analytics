@@ -1,0 +1,815 @@
+---
+title: "BT2103 Group Project"
+output: html_notebook
+---
+
+
+```{r load-libraries, warning = FALSE}
+library(ParBayesianOptimization)
+library(doParallel)
+library(rpivotTable)
+library(ggpubr)
+library(xgboost)
+library(performanceEstimation)
+library(randomForest)
+library(FactoMineR)
+library(rstatix)
+library(GGally)
+library(ggplot2)
+library(factoextra)
+library(leaps)
+library(corrplot)
+library(ggcorrplot)
+library(tidyverse)  
+library(broom)  
+library(dplyr)
+library(ggfortify)
+library(class)
+library(caret)
+library(e1071)
+library(pROC)
+library(ROCit)
+library(knitr)
+
+options(scipen = 999)
+knitr::opts_chunk$set(echo = FALSE, cache = TRUE)
+```
+
+```{r read-table}
+
+data <- read.table("card.csv",sep=",",skip=2,header=FALSE)
+header <- scan("card.csv",sep=",",nlines=2,what=character())
+
+colnames(data) = header[26:length(header)] #Renaming columns
+colnames(data) = tolower(colnames(data))
+names(data)[length(colnames(data))] = "default_next" 
+
+```
+####
+Variables
+ID: ID of each client
+LIMIT_BAL: Amount of given credit in NT dollars (includes individual and family/supplementary credit
+SEX: Gender (1=male, 2=female)
+EDUCATION: (1=graduate school, 2=university, 3=high school, 4=others, 5=unknown, 6=unknown)
+MARRIAGE: Marital status (1=married, 2=single, 3=others)
+AGE: Age in years
+PAY_0: Repayment status in September, 2005 (-1=pay duly, 1=payment delay for one month, 2=payment delay for two months, … 8=payment delay for eight months, 9=payment delay for nine months and above)
+PAY_2: Repayment status in August, 2005 (scale same as above)
+PAY_3: Repayment status in July, 2005 (scale same as above)
+PAY_4: Repayment status in June, 2005 (scale same as above)
+PAY_5: Repayment status in May, 2005 (scale same as above)
+PAY_6: Repayment status in April, 2005 (scale same as above)
+BILL_AMT1: Amount of bill statement in September, 2005 (NT dollar)
+BILL_AMT2: Amount of bill statement in August, 2005 (NT dollar)
+BILL_AMT3: Amount of bill statement in July, 2005 (NT dollar)
+BILL_AMT4: Amount of bill statement in June, 2005 (NT dollar)
+BILL_AMT5: Amount of bill statement in May, 2005 (NT dollar)
+BILL_AMT6: Amount of bill statement in April, 2005 (NT dollar)
+PAY_AMT1: Amount of previous payment in September, 2005 (NT dollar)
+PAY_AMT2: Amount of previous payment in August, 2005 (NT dollar)
+PAY_AMT3: Amount of previous payment in July, 2005 (NT dollar)
+PAY_AMT4: Amount of previous payment in June, 2005 (NT dollar)
+PAY_AMT5: Amount of previous payment in May, 2005 (NT dollar)
+PAY_AMT6: Amount of previous payment in April, 2005 (NT dollar)
+default.payment.next.month: Default payment (1=yes, 0=no)
+
+From https://www.kaggle.com/datasets/uciml/default-of-credit-card-clients-dataset
+
+From the discussion on the below website, it seems that the PAY_N variables have been clarified to be: -2: No consumption; -1: Paid in full; 0: The use of revolving credit; 1 = payment delay for one month; 2 = payment delay for two months; . . .; 8 = payment delay for eight months; 9 = payment delay for nine months and above.
+https://www.kaggle.com/datasets/uciml/default-of-credit-card-clients-dataset/discussion/34608
+
+
+```{r Exploratory-data-Analysis, echo = FALSE}
+dim(data)
+#30000 rows, 25 variables
+
+head(data, 10)
+summary(data)
+str(data)
+
+# At first glance, it seems that there are data entries that seem out of place. For example, we have a `marriage` value of 0 in certain entries, that have no particular meaning. Also, we have `education` = "5" and "6" both categorized as unknown, which does not make much sense. 
+
+factor_cols <- c('sex', 'education', 'marriage', 'pay_0', 'pay_2', 'pay_3', 'pay_4', 'pay_5', 'pay_6', "default_next")
+data[factor_cols] = lapply(data[factor_cols], factor)
+
+num_cols = colnames(data)[14:ncol(data)-1]
+num_cols = c('limit_bal', 'age', num_cols)
+
+colSums(is.na(data))
+#There are no missing values observed in the dataset.
+```
+
+
+
+```{r client-default-status}
+default.freq = data %>% count(default_next)
+default.percent = 100 * round(default.freq$n/sum(default.freq$n), 2)
+default.label = paste(default.percent, "%", sep = "")
+
+ggplot(data = default.freq, aes(x = "", y=n, fill = default_next)) +
+  geom_col(color = 'white') + 
+  coord_polar('y', start = 0) +
+  ggtitle("Default Status of Clients") +
+  geom_text(aes(label = default.label), color = "black", position = position_stack(vjust = 0.5)) + 
+  theme(panel.background = element_blank(),
+        axis.line = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank(),
+        plot.title = element_text(hjust = 0.5, size = 14)) +
+  scale_fill_discrete(name = "Defaulted on Payment", labels = c("No", "Yes"))
+
+# We have an imbalanced data set, whereby only 22% of clients default on their payment next month.
+```
+
+```{r client-gender}
+gender.freq = data %>% count(sex)
+gender.percent = 100 * round(gender.freq$n/sum(gender.freq$n), 2)
+gender.label = paste(gender.percent, "%", sep = "")
+
+ggplot(data = gender.freq, aes(x = "", y=n, fill = sex)) +
+  geom_col(color = 'white') + 
+  coord_polar('y', start = 0) +
+  ggtitle("Gender of Clients") +
+  geom_text(aes(label = gender.label), color = "black", position = position_stack(vjust = 0.5)) + 
+  theme(panel.background = element_blank(),
+        axis.line = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank(),
+        plot.title = element_text(hjust = 0.5, size = 14)) +
+  scale_fill_discrete(name = "Gender", labels = c("Male", "Female")) 
+# From the pie chart generated, we can see that there are many more females than males.
+
+# Comparison of Sex grouped by Payment Default Status
+ggplot(data = data, aes(x = sex, fill = default_next)) +
+    geom_bar(stat = "count", position = "dodge") +
+    ggtitle("Frequency Distribution of Sex by Payment Default Status") +
+    theme(plot.title = element_text(hjust = 0.5)) + 
+    labs(x = "Sex", y = "Frequency") +
+    scale_x_discrete(labels = c("Male", "Female")) +
+    scale_fill_brewer(palette = "Paired") 
+
+rpivotTable(data, rows = "sex", cols = "default_next", subtotals = TRUE) 
+
+#From the pivot table, it seems that males have a higher probability to default on their payment as compared to females (24.2% to 20.8%)
+
+chisq.test(data$sex, data$default_next)
+# From our Chi-square test of independence, we obtain a p-value that is very small. We have sufficient evidence to reject the null hypothesis that the clients' gender and credit default status are not related. Thus, we can conclude that there is a significant relationship between the two variables. However, it seems rather counter-intuitive that an individual's gender would affect their tendency to default on credit. We shall examine this again in Feature Selection to determine if it should be included in our model.
+
+ggplot(data, aes(x = limit_bal/1000, fill = default_next)) +
+  geom_histogram(bins = 30, color = "white") +
+  labs(x = "Limit Balance (in thousands of dollars)", y = "Frequency", title = "Limit Balance grouped by Gender") +
+  facet_wrap(~sex) +
+  scale_fill_brewer(palette = "Accent") +
+  theme_bw()
+
+aggregate(data$limit_bal, list(data$sex), mean)
+# Calculating the mean credit limit balance grouped by gender, we can see that male clients have a slightly lower mean credit limit balance than females.
+
+```
+```{r client-marital-status}
+# Comparison of Marital Status grouped by Payment Default Status
+ggplot(data = data, aes(x = marriage, fill = default_next)) +
+    geom_bar(stat = "count", position = "dodge") +
+    ggtitle("Frequency Distribution of Marital Status by Payment Default Status") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    labs(x = "Marital Status", y = "Frequency") +
+    scale_x_discrete(labels = c("Unknown", "Married", "Single", "Others")) +
+    scale_fill_brewer(palette = "Paired") 
+# From the bar chart generated, we can see that a large proportion of clients are either married or single.
+
+data[!(data$marriage %in% c(1,2,3)), ]
+data[!(data$marriage %in% c(1,2,3)), "marriage"] <- 3
+# There are unexplained or unknown values in marriage. We can categorize them under "Others"
+
+ggplot(data = data, aes(x = marriage, fill = default_next)) +
+    geom_bar(stat = "count", position = "dodge") +
+    ggtitle("Frequency Distribution of Marital Status by Payment Default Status") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    labs(x = "Marital Status", y = "Frequency") +
+    scale_x_discrete(labels = c("Married", "Single", "Others")) +
+    scale_fill_brewer(palette = "Paired") 
+
+rpivotTable(data, rows = "marriage", cols = "default_next", subtotals = TRUE) 
+# From the pivot table generated, it seems that married individuals and individuals of marital status denoted by "Others" have a higher probability of defaulting as compared to single individuals (23.5% and 23.6% respectively vs 20.9%).
+
+chisq.test(data$marriage, data$default_next)
+# From our Chi-square test of independence, we obtain a p-value that is very small. We have sufficient evidence to reject the null hypothesis that the clients' marital status and credit default status are not related. Thus, we can conclude that there is a significant relationship between the two variables.
+
+ggplot(data, aes(x = limit_bal/1000, fill = default_next)) +
+  geom_histogram(bins = 30, color = "white") +
+  labs(x = "Limit Balance (in thousands of dollars)", y = "Frequency", title = "Limit Balance grouped by Marital Status") +
+  facet_wrap(~marriage) +
+  scale_fill_brewer(palette = "Accent") +
+  theme_bw()
+
+aggregate(data$limit_bal, list(data$marriage), mean)
+# Calculating the mean credit limit balance grouped by marital status, we can see that married clients have the highest mean credit limit balance, followed by single clients, then those from the "Unknown" and "Others" category.
+```
+
+
+```{r client-education-level}
+#Comparison of Education Level grouped by Payment Default Status
+ggplot(data = data, aes(x = education, fill = default_next)) +
+    geom_bar(stat = "count", position = "dodge") +
+    ggtitle("Frequency Distribution of Education Level grouped by Payment Default Status") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    labs(x = "Education", y = "Frequency") +
+    scale_x_discrete(labels = c("Unknown", "Grad School", "University", "High School", "Others", "Unknown", "Unknown")) +
+    scale_fill_brewer(palette = "Paired") 
+# From the bar chart generated, we can see that a large proportion of our clients are from universities and graduate schools.
+
+data[data$education %in% c(0,5,6),]
+data[data$education %in% c(0,5,6), "education"] <- 4
+# There are the unexplained unknown values in education, education = 0, 5 and 6. We shall categorize them under "Others"
+ggplot(data = data, aes(x = education, fill = default_next)) +
+    geom_bar(stat = "count", position = "dodge") +
+    ggtitle("Frequency Distribution of Education Level grouped by Payment Default Status") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    labs(x = "Education", y = "Frequency") +
+    scale_x_discrete(labels = c("Grad School", "University", "High School", "Others")) +
+    scale_fill_brewer(palette = "Paired") 
+
+rpivotTable(data, rows = "education", cols = "default_next", subtotals = TRUE) 
+# From the pivot table generated, it seems that the lower the client's education level, the higher the probability of defaulting.
+
+chisq.test(data$education, data$default_next)
+# From our Chi-square test of independence, we obtain a p-value that is very small. We have sufficient evidence to reject the null hypothesis that the clients' education level and credit default status are not related. Thus, we can conclude that there is a significant relationship between the two variables. 
+
+ggplot(data, aes(x = limit_bal/1000, fill = default_next)) +
+  geom_histogram(bins = 30, color = "white") +
+  labs(x = "Limit Balance (in thousands of dollars)", y = "Frequency", title = "Limit Balance grouped by Education level") +
+  facet_wrap(~education) +
+  scale_fill_brewer(palette = "Accent") +
+  theme_bw()
+
+aggregate(data$limit_bal, list(data$education), mean)
+# Calculating the mean credit limit balance grouped by education level, we can see that clients with higher education levels have a higher credit limit balance on average, which might explain our above findings. Furthermore, we see a large difference in mean credit limit balance in clients from graduate schools, and those of lower education levels.
+
+```
+
+
+```{r client-age}
+ggplot(data, aes(x = age, fill = default_next)) +
+  geom_histogram(bins = 30, color = "white") +
+  labs(x = "Age", y = "Frequency", title = "Ages of Clients") +
+  scale_fill_brewer(palette = "Accent") +
+  theme_bw()
+
+aggregate(data$age, list(data$default_next), mean)
+# Calculating the mean age grouped by default status, it seems that both groups have a mean age that is almost equal.
+
+data = data %>% mutate(agebin = case_when( (age >= 21) & (age <= 30) ~ 1,
+                                    (age >= 31) & (age <= 40) ~ 2,
+                                    (age >= 41) & (age <= 50) ~ 3,
+                                    (age >= 51) & (age <= 60) ~ 4,
+                                    TRUE ~ 5))
+
+ggplot(data = data, aes(x = agebin, fill = default_next)) +
+    geom_bar(stat = "count", position = "dodge") +
+    ggtitle("Frequency Distribution of Age Bin grouped by Payment Default Status") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    labs(x = "Age Bin", y = "Frequency") +
+    scale_fill_brewer(palette = "Paired") 
+
+rpivotTable(data, rows = "agebin", cols = "default_next")
+
+# From the pivot table generated, it seems that clients that are aged 31-40 have the lowest probability of defaulting (22.4%), while those aged 61 and above have the highest probability of defaulting (26.8%). However, it is of note that clients aged 61 and above only constitute a very small portion of the dataset (272 clients). Instead, if we look at the clients aged 51-60, they actually have the 2nd highest probability of defaulting (25.2%)
+
+aggregate(data$limit_bal, list(data$agebin), mean)
+
+# Interestingly, the mean credit limit balance is the highest for clients aged 31-40 (2nd highest if we include clients aged 61 and above), and the lowest for clients aged 51-60.
+data = data[, -26]
+
+```
+
+Preliminary Summary of Findings: 
+1.) 60% of the clients are female and the remaining 40% are male. Males are more likely to default than females.
+2.) Most of the clients are from graduate schools and universities. The lower the education level, the higher the probability of defaulting.
+3.) A large majority of clients are either single or married. Married individuals have a higher probability of defaulting compared to Single individuals.
+4.) 78% of clients did not default on their payment next month, while the remaining 22% did default. We are dealing with an imbalanced dataset.
+
+
+```{r client-limit-balance}
+summary(data$limit_bal)
+
+a = ggplot(data, aes(x = limit_bal/1000, fill = default_next)) +
+  geom_histogram(color = "white", bins = 40) +
+  labs(x = "Limit Balance (in thousands of dollars)", y = "Frequency", title = "Histogram of Limit Balance") +
+  theme(plot.title = element_text(hjust = 0.5, size = 14))
+
+b = ggplot(data) +
+  geom_boxplot(aes(y = limit_bal)) 
+
+boxplot.limit_bal <- boxplot(data$limit_bal, range = 3, horizontal = TRUE, main = "Box plot of Limit Balance", plot = FALSE)
+limit_bal.outliers = which(data$limit_bal %in% boxplot.limit_bal$out)
+data[limit_bal.outliers, ]
+# 1 outlier with limit_bal = 1000000. Upon further examination, it seems to simply be a very rich client and we do not do anything to this entry.
+
+c = ggplot(data) +
+  geom_boxplot(aes(x = default_next, y = limit_bal, color = default_next)) +
+  labs(title = "Credit Limit Balance grouped by Default Status") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# From the box plots generated, it seems that the credit limit balance of clients who do not default are higher than those who default at the 25th - 100th percentile. This is intuitive as clients with a higher credit limit balance are generally more trustworthy or wealthier, and less likely to default.
+
+aggregate(data$limit_bal, list(data$default_next), mean)
+# Calculating the mean limit balance grouped by default status, we can see that the mean limit balance for clients who did not default is significantly higher than those who defaulted.
+
+ggarrange(a, ggarrange(b,c), nrow = 2)
+```
+
+```{r bill-pay-repayment}
+
+for (col in factor_cols[4:9]) {
+  print(ggplot(data, aes_string(x = col, fill = "default_next")) +
+          geom_bar(position = "dodge", stat = "count") +
+          labs(title = col, y = "Frequency") +
+          theme(plot.title = element_text(hjust = 0.5, size = 14)) +
+          scale_fill_brewer(palette = "Paired"))
+}
+
+rpivotTable(data, rows = "pay_0", cols = "default_next", subtotals = TRUE) 
+# It seems that most clients have a repayment status of either -2, -1, or 0, which implies that they paid their bills on time. Based on the repayment statuses for September alone, it seems that clients who paid their bills on time are much less likely to default. The propensity to default then rises significantly as the payment gets delayed. The same trend can also be observed for the month of August. However, it is of note that the number of clients with delayed payments is much lower than that of clients who paid their bills on time, which may exaggerate certain proportions.
+
+for (col in num_cols[-c(1,2)]) {
+  print(ggplot(data, aes_string(x = col)) +
+  geom_histogram(bins = 30, color = "white") +
+  ggtitle(col) +
+  theme_bw())
+}
+# There seems to be a large range of values for bill_amt and pay_amt, which implies a need to scale the data. It also seems that a large number of clients have a bill statement of 0, or had a previous payment amount of 0.
+
+corrplot(cor(data[, num_cols[-2]]), method = "circle")
+# It seems that bill_amtX are all highly correlated to each other. This likely has to do with the fact that the outstanding bill amount for a month is also the bill amount from the previous amount, but after deducting the amount paid for that month.
+
+# Consider clients with a bill amount that is greater than their credit limit balance
+data[data$bill_amt1 > data$limit_bal, ] %>% count(default_next)
+data[data$bill_amt1 <= data$limit_bal, ] %>% count(default_next)
+# It seems that for each month, clients with a bill amount that is greater than their credit limit balance have a higher probability of defaulting.
+
+```
+
+```{r feature-engineering}
+# We can see that there are several rare levels for each month of repayment status pay_X, namely pay_X >= 4. We can consider condensing them to a single level pay_X = 4 denoting that the client has delayed their payment for at least 4 months.
+
+for (row in 1:nrow(data)) {
+  for (col in factor_cols[4:9]) {
+    if (as.numeric(data[row, col]) >= 7) {
+      data[row, col] = 4
+    } 
+  }
+}
+
+# We also know that clients with a bill amount that is greater than their credit limit balance have a higher probability of defaulting. We can consider adding a column for the 2 latest months, September and August, that denotes the ratio of their bill amount to their credit limit balance. Instead of including all the months, we only include the 2 latest months due to the possibility that the credit limit balance may change from month to month.
+
+data = data %>% mutate(bill_clb_ratio1 = round(bill_amt1/limit_bal, 3)) # Ratio of bill amount to credit limit balance for September
+data = data %>% mutate(bill_clb_ratio2 = round(bill_amt2/limit_bal, 3)) # Ratio of bill amount to credit limit balance for August
+
+data[factor_cols] = lapply(data[factor_cols], factor)
+num_cols = c(num_cols, "bill_clb_ratio1", "bill_clb_ratio2")
+
+```
+
+
+```{r train-test-split}
+
+set.seed(1234)
+n = nrow(data)
+index <- 1:nrow(data)
+testindex <- sample(index, trunc(n)/4)
+test.data <- data[testindex,]
+train.data <- data[-testindex,]
+
+train.data %>% count(default_next)
+test.data %>% count(default_next)
+
+# The data set is imbalanced, with only 22% of clients having defaulted on their payment. This similarly results in imbalanced training and test data sets, which may cause our model to be biased towards clients that do not default i.e. the majority class and affect our model accuracy. To evaluate our model later, we can ideally use the F1 score as the scoring metric over accuracy. Similarly, we can introduce weights in our models where appropriate to address the imbalance.
+
+# Alternatively, consider applying Synthetic Minority Oversampling Technique to our training dataset to oversample observations from our default_next = 1 class.
+smote.train.data = smote(default_next ~ ., data = train.data[, -1])
+
+smote.train.data %>% count(default_next)
+
+# We now have a training dataset that is much more balanced in terms of default status.
+```
+
+
+```{r scaling-data, echo = FALSE}
+
+#Scaling train data
+num_train = train.data[, num_cols]
+scaled_num_train = scale(num_train)
+std_train = cbind(id = train.data$id, train.data[, factor_cols], as.data.frame(scaled_num_train))
+std_train = std_train %>% select(colnames(data))
+
+#Scaling SMOTE train data
+smote.num_train = smote.train.data[, num_cols]
+smote.scaled_num_train = scale(smote.num_train)
+smote.std_train = cbind(smote.train.data[, factor_cols], as.data.frame(smote.scaled_num_train))
+smote.std_train = smote.std_train %>% select(colnames(data)[-1])
+
+#Scaling test data with same parameters as train data
+num_test = test.data[, num_cols]
+scaled_num_test = scale(num_test, attr(scaled_num_train, "scaled:center"), attr(scaled_num_train, "scaled:scale"))
+std_test = cbind(id = test.data$id, test.data[, factor_cols], as.data.frame(scaled_num_test))
+std_test = std_test %>% select(colnames(data))
+
+```
+
+
+```{r MFA, echo = FALSE}
+
+res.MFA = MFA(smote.std_train, group = c(1, 3, 1, 6, 6, 6, 1, 2), type = c("c", "n", "c", "n", "c", "c", "n", "c"), ncp = 5, name.group = c("limit.balance", "demographics", "age", "repayment.status", "bill.amount", "prev.payment", "default.next.month", "bill.clb.ratio"), num.group.sup = 7, graph = FALSE)
+
+# Group 1: Limit Balance of clients
+# Group 2: Sex, Education Level, Marital Status
+# Group 3: Age
+# Group 4: Repayment Status (pay_X)
+# Group 5: Amount of bill statement (bill_amtX)
+# Group 6: Amount of previous payment (pay_X)
+# Group 7: Ratio of bill amount to credit limit balance
+
+summary(res.MFA)
+
+fviz_mfa_var(res.MFA, "group")
+
+fviz_contrib(res.MFA, "group", axes = 1)
+fviz_contrib(res.MFA, "group", axes = 2)
+
+# Dimension 1 explains 11.6% of variance, with bill.clb.ratio and repayment status contributing the most.
+# Dimension 2 explains 9.6% of variance, with limit.balance, prev.payment and bill.amount contributing the most.
+```
+
+
+```{r feature-selection}
+# Fitting random forest model to training data with ntree = 500 (default)
+set.seed(123)
+res.rf = randomForest(default_next ~ ., data = train.data[, -1], ntree = 500)
+importance(res.rf)
+varImpPlot(res.rf, sort = TRUE, main = "Importance of Predictors")
+
+# It seems that pay_0 is the most important feature, followed by age and bill_amt1.
+
+pred.rf.test = predict(res.rf, test.data)
+cm_rf = confusionMatrix(pred.rf.test, test.data$default_next, mode = "everything", dnn = c("Predicted", "Actual"), positive = "1")
+cm_rf
+
+pred2.rf.test = predict(res.rf, test.data[, -1], type = "prob")
+rocit.rf = rocit(score = pred2.rf.test[, 2], class = test.data$default_next)
+summary(rocit.rf)
+plot(rocit.rf)
+ksplot(rocit.rf)
+
+## Filter method using corr plots
+corrM <- cor(std_train[, num_cols],use="complete.obs") ## linear relationship, not definite.
+ggcorrplot(corrM, hc.order = TRUE,
+   lab = TRUE,
+   lab_size = 2,
+   tl.cex = 5) 
+
+# From the corr-plot, we can see that bill_amt 1 to bill_amt 6 are highly correlated to one another. As seen from the description of the variables, these variables are essentially of the same type, in different time periods.
+
+ggplot(data = as.data.frame(cm_rf$table), mapping = aes(x = Predicted, y = Actual)) +
+    geom_tile(aes(fill = Freq), colour = "white") +
+    geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+    scale_fill_gradient(low = "blue", high = "red") +
+    theme_bw() + theme(legend.position = "none")
+
+```
+
+```{r random-forest-smote}
+# Fitting random forest model to SMOTE training data with ntree = 500
+set.seed(123)
+res.rf.smote = randomForest(default_next ~ ., data = smote.train.data, ntree = 500)
+
+importance(res.rf.smote)
+varImpPlot(res.rf.smote, sort = TRUE, n.var = 25, main = "Importance of Predictors - SMOTE")
+
+# When fitted to the SMOTE training dataset, the most important features are pay_0 and limit_bal. We then observe a number of predictors with similar mean GINI scores, then a steep fall in mean decrease GINI score from bill_clb_ratio3 onwards, implying that the remaining variables are not as important in predicting client default status. Interestingly, we can see that our categorical client demographics - education, marriage and sex, are not very important as predictors.
+
+pred.rf.test.smote = predict(res.rf.smote, test.data[, -1])
+cm_rf_smote = confusionMatrix(pred.rf.test.smote, test.data$default_next, mode = "everything", dnn = c("Predicted", "Actual"), positive = "1")
+cm_rf_smote
+
+# Our accuracy and precision falls slightly when training our RF on the SMOTE training dataset, however the recall, F1 score and balanced accuracy increases significantly.
+# Given the imbalanced nature of our test set, accuracy is not a good evaluation metric. Instead, recall, F1 score and balanced accuracy might evaluate our model better as we are more interested in correctly predicting the number of customers who default. From this point, we can consider fitting our model to the SMOTE training dataset.
+
+pred2.rf.test.smote = predict(res.rf.smote, test.data[, -1], type = "prob")
+rocit.rf_smote = rocit(score = pred2.rf.test.smote[, 2], class = std_test$default_next)
+summary(rocit.rf_smote)
+plot(rocit.rf_smote)
+ksplot(rocit.rf_smote) 
+
+ggplot(data = as.data.frame(cm_rf_smote$table), mapping = aes(x = Predicted, y = Actual)) +
+    geom_tile(aes(fill = Freq), colour = "white") +
+    geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+    scale_fill_gradient(low = "blue", high = "red") +
+    ggtitle("Confusion Matrix - Random Forest") +
+    theme_bw() + theme(legend.position = "none")
+
+# Let us consider taking a subset of the 18 most important predictors.
+selected_cols = c("pay_0", "limit_bal", "age", "bill_clb_ratio1", "pay_amt2", "bill_clb_ratio2", "pay_amt6", "bill_amt1", "pay_amt1", "pay_2", "pay_amt3", "bill_amt2", "bill_amt3", "pay_amt5", "bill_amt6", "bill_amt4", "pay_amt4", "bill_amt5", "default_next")
+
+```
+
+
+```{r random-forest}
+set.seed(123)
+res.rf.sub = randomForest(default_next ~ ., data = smote.train.data[, selected_cols], ntree = 1000)
+
+ntree.error = data.frame(ntrees = rep(1:nrow(res.rf.sub$err.rate), times = 3),
+                       class = rep(c("OOB", "Did not default", "Default"), each = nrow(res.rf.sub$err.rate)),
+                       error = c(res.rf.sub$err.rate[, "OOB"], res.rf.sub$err.rate[, "0"], res.rf.sub$err.rate[, "1"])) # Error rate at each ntree
+
+ggplot(ntree.error, aes(x = ntrees, y = error, color = class)) +
+  geom_line()
+# Error rate appears to be stable at ntree > 500
+
+mtry.error = data.frame(matrix(nrow = 0, ncol = 2))
+colnames(mtry.error) = c("mtry", "oob_error")
+for (i in 1:10) {
+  set.seed(123)
+  tmp = randomForest(default_next ~ ., data = smote.train.data[, selected_cols], mtry = i, ntree = 600)
+  mtry.error[nrow(mtry.error) + 1, ] = c(i, tmp$err.rate[nrow(tmp$err.rate), "OOB"])  # Find optimal mtry from 1:10
+}
+
+mtry.error[mtry.error$oob_error == min(mtry.error$oob_error), ]
+# mtry = 8 yields lowest OOB error at 600 trees
+
+# Fit RF using mtry = 8 and ntree = 600 to SMOTE training dataset
+set.seed(123)
+res.rf.sub = randomForest(default_next ~ ., data = smote.train.data[, selected_cols], mtry = 8, ntree = 600) 
+pred.rf.test.sub = predict(res.rf.sub, test.data[, -1])
+cm_rf_sub = confusionMatrix(pred.rf.test.sub, test.data$default_next, dnn = c("Predicted", "Actual"), mode = "everything", positive = "1")
+cm_rf_sub
+
+pred2.rf.test.sub = predict(res.rf.sub, test.data[, -1], type = "prob")
+rocit.rf.sub = rocit(score = pred2.rf.test.sub[, 2], class = std_test$default_next)
+summary(rocit.rf.sub)
+plot(rocit.rf.sub)
+ksplot(rocit.rf.sub)
+
+ggplot(data = as.data.frame(cm_rf_sub$table), mapping = aes(x = Predicted, y = Actual)) +
+    geom_tile(aes(fill = Freq), colour = "white") +
+    geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+    scale_fill_gradient(low = "blue", high = "red") +
+    ggtitle("Confusion Matrix - Random Forest on Selected Vars") +
+    theme_bw() + theme(legend.position = "none")
+
+```
+
+
+```{r logistic-regression, echo = FALSE}
+#Fitting logistic regression model using all variables
+set.seed(123)
+res.logit = glm(default_next ~ ., data = smote.std_train, family = "binomial") # Fitting logistic regression model to standardized SMOTE training set
+
+pred.logit.test = predict(res.logit, std_test[,-1], type = "response")
+rocit.glm = rocit(score = pred.logit.test, class = std_test$default_next)
+summary(rocit.glm)
+plot(rocit.glm)
+ksplot(rocit.glm)
+
+pred.logit.test = round(pred.logit.test)
+cm_glm = confusionMatrix(as.factor(pred.logit.test), std_test$default_next, dnn = c("Predicted", "Actual"), mode = "everything", positive = "1")
+cm_glm
+
+ggplot(data = as.data.frame(cm_glm$table), mapping = aes(x = Predicted, y = Actual)) +
+    geom_tile(aes(fill = Freq), colour = "white") +
+    geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+    scale_fill_gradient(low = "blue", high = "red") +
+    ggtitle("Confusion Matrix - Logistic Regression") +
+    theme_bw() + theme(legend.position = "none")
+
+#Fitting logistic regression model using selected variables
+res.logit2 = glm(default_next ~ ., data = smote.std_train[, selected_cols], family = "binomial")
+pred.logit2.test = predict(res.logit2, std_test[,-1], type = "response")
+rocit.glm2 = rocit(score = pred.logit2.test, class = std_test$default_next)
+summary(rocit.glm2)
+plot(rocit.glm2)
+ksplot(rocit.glm2)
+
+pred.logit2.test = round(pred.logit2.test)
+cm_glm2 = confusionMatrix(as.factor(pred.logit2.test), std_test$default_next, dnn = c("Predicted", "Actual"), mode = "everything", positive = "1")
+cm_glm2
+
+ggplot(data = as.data.frame(cm_glm2$table), mapping = aes(x = Predicted, y = Actual)) +
+    geom_tile(aes(fill = Freq), colour = "white") +
+    geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+    scale_fill_gradient(low = "blue", high = "red") +
+    ggtitle("Confusion Matrix - Logistic Regression on Selected Vars") +
+    theme_bw() + theme(legend.position = "none")
+
+anova(res.logit, test = "Chisq")
+# The anova test tells us the difference between the null and residual deviance. Analyzing the results, there is a consistent drop in residual deviance after adding each variable. Specifically, adding LIMIT_BAL, SEX, EDUCATION, MARRIAGE, PAY0 - PAY6, BILLAMT1, PAYAMT1 - PAYAMT6, bill_clb_ratio1 and bill_clb_ratio2 are statistically significant.
+
+```
+
+
+```{r xgboost}
+dtrain = xgb.DMatrix(data = data.matrix(train.data[, c(-1, -25)]), label = as.numeric(train.data$default_next)-1)
+dtest = xgb.DMatrix(data = data.matrix(test.data[, c(-1, -25)]), label = as.numeric(test.data$default_next)-1)
+weights = sum(train.data$default_next == 0)/sum(train.data$default_next == 1)
+
+set.seed(123)
+# Bayes Optimization of XGBoost hyperparameters to find max_depth, eta, gamma, min_child_weight, subsample and colsample_bytree by maximizing area under PR curve
+
+score = function(max_depth, eta, gamma, min_child_weight, subsample, colsample_bytree) {
+  dtrain = xgb.DMatrix(data = data.matrix(train.data[, c(-1, -25)]), label = as.numeric(train.data$default_next)-1)
+  params = list(max_depth = max_depth, 
+                eta = eta, 
+                gamma = gamma, 
+                min_child_weight = min_child_weight, 
+                subsample = subsample, 
+                colsample_bytree = colsample_bytree,
+                booster = "gbtree", 
+                objective = "binary:logistic", 
+                eval_metric = "aucpr", 
+                scale_pos_weight = weights, 
+                verbose = 0)
+  set.seed(123)
+  crossval.xgb = xgb.cv(params = params, 
+                        data = dtrain, 
+                        nrounds = 150, 
+                        prediction = TRUE, 
+                        early_stopping_rounds = 10, 
+                        nfold = 5, 
+                        maximize = TRUE)
+  
+  return(list(Score = max(crossval.xgb$evaluation_log$test_aucpr_mean), nrounds = crossval.xgb$best_iteration))
+}
+
+params_bounds = list(max_depth = c(3L, 10L),
+                     eta = c(0.1, 0.5),
+                     gamma = c(0, 20),
+                     min_child_weight = c(1, 25),
+                     subsample = c(0.25, 1),
+                     colsample_bytree = c(0, 1))
+
+# Parallel computing of Bayes Optimization to speed up tuning process
+cluster = makeCluster(detectCores()/2)
+registerDoParallel(cluster)
+clusterExport(cluster, c('train.data', 'params_bounds', 'weights'))
+clusterEvalQ(cluster, expr = {library(xgboost)})
+
+params_opt = bayesOpt(FUN = score, bounds = params_bounds, initPoints = 7, iters.n = 15, parallel = TRUE)
+
+stopCluster(cluster)
+registerDoSEQ()
+
+params = list(max_depth = getBestPars(params_opt)$max_depth,
+              eta = getBestPars(params_opt)$eta,
+              gamma = getBestPars(params_opt)$gamma,
+              min_child_weight = getBestPars(params_opt)$min_child_weight,
+              subsample = getBestPars(params_opt)$subsample,
+              colsample_bytree = getBestPars(params_opt)$colsample_bytree,
+              booster = "gbtree", 
+              objective = "binary:logistic", 
+              eval_metric = "aucpr", 
+              scale_pos_weight = weights, 
+              verbose = 0)
+nrounds = params_opt$scoreSummary[which(params_opt$scoreSummary$Score == max(params_opt$scoreSummary$Score))]$nrounds[1]
+
+watchlist = list(train = dtrain, test = dtest)
+res.xgboost.weighted = xgb.train(params = params, 
+                                 data = dtrain,
+                                 nrounds = nrounds,
+                                 watchlist = watchlist,
+                                 early_stopping_rounds = 10,
+                                 print_every_n = 10)
+set.seed(123)
+pred.xgboost.test = predict(res.xgboost.weighted, dtest)
+rocit.xgb = rocit(score = pred.xgboost.test, class = test.data$default_next)
+summary(rocit.xgb)
+plot(rocit.xgb)
+ksplot(rocit.xgb)
+
+pred.xgboost.test = round(pred.xgboost.test)
+cm_xgb = confusionMatrix(as.factor(pred.xgboost.test), test.data$default_next, dnn = c("Predicted", "Actual"), mode = "everything", positive = "1")
+cm_xgb
+
+imp.matrix = xgb.importance(colnames(dtrain), model = res.xgboost.weighted)
+xgb.plot.importance(imp.matrix)
+
+# The most important variables seem to be pay_0, pay_amt2 and pay_3.
+
+ggplot(data = as.data.frame(cm_xgb$table), mapping = aes(x = Predicted, y = Actual)) +
+    geom_tile(aes(fill = Freq), colour = "white") +
+    geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+    scale_fill_gradient(low = "blue", high = "red") +
+    ggtitle("Confusion Matrix - XGBoost") +
+    theme_bw() + theme(legend.position = "none")
+
+```
+
+
+```{r knn}
+set.seed(123)
+# Finding optimal k from k = 1, 21, 41, ... 181
+df.knn = data.frame(matrix(nrow = 0, ncol = 3))
+colnames(df.knn) = c("k", "balanced-accuracy", "f1")
+
+for (k in seq(1, 181, 20)) {
+  res.knn = res.knn = knn(train = smote.std_train[, -24],
+              test = std_test[, c(-1, -25)],
+              cl = smote.std_train$default_next,
+              k = k)
+  cm_knn = cm_knn = confusionMatrix(res.knn, std_test$default_next, dnn = c("Predicted", "Actual"), mode = "everything", positive = "1")
+  df.knn[nrow(df.knn) +1, ] = list(k, cm_knn$byClass[11], cm_knn$byClass[7])
+
+}
+# Set k = 141 which maximizes balanced accuracy and f1-score
+set.seed(123)
+res.knn = knn(train = smote.std_train[, -24],
+              test = std_test[, c(-1, -25)],
+              cl = smote.std_train$default_next,
+              k = df.knn[which(df.knn$f1 == max(df.knn$f1)), "k"],
+              prob = TRUE)
+
+cm_knn = confusionMatrix(res.knn, std_test$default_next, dnn = c("Predicted", "Actual"), mode = "everything", positive = "1")
+cm_knn
+
+rocit.knn = rocit(score = as.numeric(res.knn) - 1, class = std_test$default_next)
+summary(rocit.knn)
+plot(rocit.knn)
+
+ggplot(data = as.data.frame(cm_knn$table), mapping = aes(x = Predicted, y = Actual)) +
+    geom_tile(aes(fill = Freq), colour = "white") +
+    geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+    scale_fill_gradient(low = "blue", high = "red") +
+    ggtitle("Confusion Matrix - kNN") +
+    theme_bw() + theme(legend.position = "none")
+```
+
+
+``` {r nnet}
+set.seed(123)
+nnetTunegrid = expand.grid(size = c(12),
+                            decay = c(0.08))
+
+trainControl = trainControl(method = "repeatedcv",
+                             number = 4, #Number of folds in which we want our data to be divided.
+                             repeats = 3)
+                             ##classProbs = TRUE)
+
+nnetTune = train(
+  default_next ~ pay_0 + bill_amt1 + limit_bal + pay_amt2 + bill_clb_ratio1 + bill_clb_ratio2, # Given the slow training time for neural network, we limit the number of features we train the neural network on to speed up the training process. We use the top few predictors given by the feature importance graph of the random forest comprising of columns pertaining to September and August.
+  data = smote.std_train,
+  method = 'nnet',              
+  trControl = trainControl,
+  maxit = 100 ,                  
+  rang = 0.6,                    
+  trace = TRUE,
+  verbose = FALSE,
+  tuneGrid= nnetTunegrid,
+  MaxNWts=2000
+)
+set.seed(123)
+nnet_pred = predict(nnetTune, std_test, type = "prob")
+rocit.nnet = rocit(score = nnet_pred$`1`, class = std_test$default_next)
+summary(rocit.nnet)
+plot(rocit.nnet)
+ksplot(rocit.nnet)
+
+nnet_pred = predict(nnetTune, std_test)
+cm_nnet = confusionMatrix(as.factor(nnet_pred),
+                std_test$default_next,
+                positive = "1",
+                dnn=c("Predicted","Actual"),
+                mode="everything")
+
+cm_nnet
+
+ggplot(data = as.data.frame(cm_nnet$table), mapping = aes(x = Predicted, y = Actual)) +
+    geom_tile(aes(fill = Freq), colour = "white") +
+    geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+    scale_fill_gradient(low = "blue", high = "red") +
+    ggtitle("Confusion Matrix - kNN") +
+    theme_bw() + theme(legend.position = "none")
+
+
+
+
+```
+
+
+```{r model-evaluation}
+model_name = c("Random Forest", "Random Forest SMOTE", "Random Forest Sub", "Logistic Regression", "Logistic Regression Sub", "XGBoost", "kNN", "Neural Network")
+models = data.frame(model_name)
+balanced_acc = rbind(cm_rf$byClass[11], cm_rf_smote$byClass[11], cm_rf_sub$byClass[11], cm_glm$byClass[11], cm_glm2$byClass[11], cm_xgb$byClass[11], cm_knn$byClass[11], cm_nnet$byClass[11])
+precision = rbind(cm_rf$byClass[5], cm_rf_smote$byClass[5], cm_rf_sub$byClass[5], cm_glm$byClass[5], cm_glm2$byClass[5], cm_xgb$byClass[5], cm_knn$byClass[5], cm_nnet$byClass[5])
+recall = rbind(cm_rf$byClass[6], cm_rf_smote$byClass[6], cm_rf_sub$byClass[6], cm_glm$byClass[6], cm_glm2$byClass[6], cm_xgb$byClass[6], cm_knn$byClass[6], cm_nnet$byClass[6])
+f1 = rbind(cm_rf$byClass[7], cm_rf_smote$byClass[7], cm_rf_sub$byClass[7], cm_glm$byClass[7], cm_glm2$byClass[7], cm_xgb$byClass[7], cm_knn$byClass[7], cm_nnet$byClass[7])
+auc = rbind(rocit.rf$AUC, rocit.rf_smote$AUC, rocit.rf.sub$AUC, rocit.glm$AUC, rocit.glm2$AUC, rocit.xgb$AUC, rocit.knn$AUC, rocit.nnet$AUC)
+models = cbind(models, balanced_acc, precision, recall, f1, auc)
+
+kable(models)
+
+```
+
+
+
+
+
